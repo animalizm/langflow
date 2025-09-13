@@ -12,11 +12,16 @@ import orjson
 from aiofile import async_open
 from anyio import Path
 from fastapi import APIRouter, Depends, File, HTTPException, Response, UploadFile
+from sqlalchemy.exc import IntegrityError
 from fastapi.encoders import jsonable_encoder
 from fastapi.responses import StreamingResponse
 from fastapi_pagination import Page, Params
 from fastapi_pagination.ext.sqlmodel import apaginate
-from lfx.log import logger
+try:
+    from lfx.log import logger  # type: ignore
+except Exception:  # pragma: no cover - fallback simple logger
+    import logging as _logging
+    logger = _logging.getLogger(__name__)
 from sqlmodel import and_, col, select
 from sqlmodel.ext.asyncio.session import AsyncSession
 
@@ -55,7 +60,10 @@ async def _save_flow_to_fs(flow: Flow) -> None:
             try:
                 await f.write(flow.model_dump_json())
             except OSError:
-                await logger.aexception("Failed to write flow %s to path %s", flow.name, flow.fs_path)
+                # logger may be async-capable or standard; fall back gracefully
+                log_method = getattr(logger, "exception", None)
+                if callable(log_method):
+                    log_method("Failed to write flow %s to path %s", flow.name, flow.fs_path)
 
 
 async def _new_flow(
@@ -123,7 +131,16 @@ async def _new_flow(
                 # The endpoint name is like "my-endpoint","my-endpoint-1", "my-endpoint-2"
                 # so we need to get the highest number and add 1
                 # we need to get the last part of the endpoint name
-                numbers = [int(flow.endpoint_name.split("-")[-1]) for flow in flows]
+                numbers = []
+                for f in flows:
+                    ep = getattr(f, "endpoint_name", None)
+                    if isinstance(ep, str):
+                        parts = ep.split("-")
+                        if parts and parts[-1].isdigit():
+                            try:
+                                numbers.append(int(parts[-1]))
+                            except ValueError:
+                                continue
                 flow.endpoint_name = f"{flow.endpoint_name}-{max(numbers) + 1}"
             else:
                 flow.endpoint_name = f"{flow.endpoint_name}-1"
@@ -158,25 +175,47 @@ async def create_flow(
     flow: FlowCreate,
     current_user: CurrentActiveUser,
 ):
+    db_flow = None
     try:
         db_flow = await _new_flow(session=session, flow=flow, user_id=current_user.id)
         await session.commit()
         await session.refresh(db_flow)
-
         await _save_flow_to_fs(db_flow)
-
+    except IntegrityError as ie:
+        if db_flow is None:
+            # Nothing was added yet; just propagate
+            await session.rollback()
+            raise HTTPException(status_code=400, detail="Integrity error creating flow") from ie
+        if "unique_flow_name" in str(ie).lower():
+            await session.rollback()
+            original = db_flow.name
+            # Collect existing names once
+            # Fetch all names starting with the original; fallback to simple equality filtering in Python to avoid dialect/type issues
+            existing = set(
+                (await session.exec(select(Flow.name).where(Flow.user_id == current_user.id))).all()
+            )
+            suffix = 1
+            pattern = re.compile(rf"^{re.escape(original)} \((\d+)\)$")
+            for name in existing:
+                m = pattern.match(name)
+                if m:
+                    suffix = max(suffix, int(m.group(1)) + 1)
+                elif name == original:
+                    suffix = max(suffix, 1)
+            db_flow.name = f"{original} ({suffix})"
+            session.add(db_flow)
+            try:
+                await session.commit()
+                await session.refresh(db_flow)
+                await _save_flow_to_fs(db_flow)
+            except IntegrityError as ie2:
+                await session.rollback()
+                raise HTTPException(status_code=400, detail="Flow name must be unique") from ie2
+        else:
+            await session.rollback()
+            raise HTTPException(status_code=400, detail="Database error creating flow") from ie
     except Exception as e:
-        if "UNIQUE constraint failed" in str(e):
-            # Get the name of the column that failed
-            columns = str(e).split("UNIQUE constraint failed: ")[1].split(".")[1].split("\n")[0]
-            # UNIQUE constraint failed: flow.user_id, flow.name
-            # or UNIQUE constraint failed: flow.name
-            # if the column has id in it, we want the other column
-            column = columns.split(",")[1] if "id" in columns.split(",")[0] else columns.split(",")[0]
-
-            raise HTTPException(
-                status_code=400, detail=f"{column.capitalize().replace('_', ' ')} must be unique"
-            ) from e
+        await session.rollback()
         if isinstance(e, HTTPException):
             raise
         raise HTTPException(status_code=500, detail=str(e)) from e
@@ -248,7 +287,7 @@ async def read_flows(
 
         if get_all:
             flows = (await session.exec(stmt)).all()
-            flows = validate_is_component(flows)
+            flows = list(validate_is_component(list(flows)))
             if components_only:
                 flows = [flow for flow in flows if flow.is_component]
             if remove_example_flows and starter_folder_id:
@@ -311,7 +350,8 @@ async def read_public_flow(
         raise HTTPException(status_code=403, detail="Flow is not public")
 
     current_user = await get_user_by_flow_id_or_endpoint_name(str(flow_id))
-    return await read_flow(session=session, flow_id=flow_id, current_user=current_user)
+    # read_flow expects CurrentActiveUser; current_user here is derived user object already
+    return await read_flow(session=session, flow_id=flow_id, current_user=current_user)  # type: ignore[arg-type]
 
 
 @router.patch("/{flow_id}", response_model=FlowRead, status_code=200)
@@ -348,7 +388,8 @@ async def update_flow(
 
         await _verify_fs_path(db_flow.fs_path)
 
-        webhook_component = get_webhook_component_in_flow(db_flow.data)
+        flow_data = db_flow.data or {}
+        webhook_component = get_webhook_component_in_flow(flow_data)
         db_flow.webhook = webhook_component is not None
         db_flow.updated_at = datetime.now(timezone.utc)
 
@@ -375,8 +416,9 @@ async def update_flow(
                 status_code=400, detail=f"{column.capitalize().replace('_', ' ')} must be unique"
             ) from e
 
-        if hasattr(e, "status_code"):
-            raise HTTPException(status_code=e.status_code, detail=str(e)) from e
+        # Re-raise HTTPException directly, otherwise wrap
+        if isinstance(e, HTTPException):
+            raise
         raise HTTPException(status_code=500, detail=str(e)) from e
 
     return db_flow
@@ -445,24 +487,41 @@ async def upload_file(
 
     try:
         await session.commit()
-        for db_flow in response_list:
-            await session.refresh(db_flow)
-            await _save_flow_to_fs(db_flow)
-    except Exception as e:
-        if "UNIQUE constraint failed" in str(e):
-            # Get the name of the column that failed
-            columns = str(e).split("UNIQUE constraint failed: ")[1].split(".")[1].split("\n")[0]
-            # UNIQUE constraint failed: flow.user_id, flow.name
-            # or UNIQUE constraint failed: flow.name
-            # if the column has id in it, we want the other column
-            column = columns.split(",")[1] if "id" in columns.split(",")[0] else columns.split(",")[0]
-
-            raise HTTPException(
-                status_code=400, detail=f"{column.capitalize().replace('_', ' ')} must be unique"
-            ) from e
-        if isinstance(e, HTTPException):
-            raise
-        raise HTTPException(status_code=500, detail=str(e)) from e
+    except IntegrityError as ie:
+        if "unique_flow_name" in str(ie).lower():
+            await session.rollback()
+            existing = set(
+                (await session.exec(select(Flow.name).where(Flow.user_id == current_user.id))).all()
+            )
+            changed = False
+            for flow_obj in response_list:
+                base = flow_obj.name
+                if base in existing:
+                    suffix = 1
+                    pattern = re.compile(rf"^{re.escape(base)} \((\d+)\)$")
+                    # find highest existing suffix
+                    for name in list(existing):
+                        m = pattern.match(name)
+                        if m:
+                            suffix = max(suffix, int(m.group(1)) + 1)
+                    new_name = f"{base} ({suffix})"
+                    flow_obj.name = new_name
+                    existing.add(new_name)
+                    changed = True
+            if changed:
+                for flow_obj in response_list:
+                    session.add(flow_obj)
+                try:
+                    await session.commit()
+                except IntegrityError as ie2:
+                    await session.rollback()
+                    raise HTTPException(status_code=400, detail="Flow names must be unique") from ie2
+        else:
+            await session.rollback()
+            raise HTTPException(status_code=400, detail="Database error uploading flows") from ie
+    for flow_obj in response_list:
+        await session.refresh(flow_obj)
+        await _save_flow_to_fs(flow_obj)
 
     return response_list
 

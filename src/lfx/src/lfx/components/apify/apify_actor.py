@@ -185,9 +185,9 @@ class ApifyActorsComponent(Component):
             raise ValueError(msg)
         # when token changes, create a new client
         if self._apify_client is None or self._apify_client.token != self.apify_token:
+            # Create a fresh client. Avoid touching internal HTTP client attributes to ensure compatibility
+            # across apify-client versions.
             self._apify_client = ApifyClient(self.apify_token)
-            if httpx_client := self._apify_client.http_client.httpx_client:
-                httpx_client.headers["user-agent"] += "; Origin/langflow"
         return self._apify_client
 
     def _get_actor_latest_build(self, actor_id: str) -> dict:
@@ -279,8 +279,24 @@ class ApifyActorsComponent(Component):
         # stream logs
         with run_client.log().stream() as response:
             if response:
-                for line in response.iter_lines():
-                    self.log(line)
+                # httpx.Response doesn't have iter_lines (requests has). Support both.
+                if hasattr(response, "iter_lines"):
+                    for line in response.iter_lines():
+                        self.log(line)
+                else:
+                    try:
+                        for chunk in response.iter_text():
+                            for line in chunk.splitlines():
+                                if line:
+                                    self.log(line)
+                    except Exception:
+                        # As a last resort, try reading text at once (may block until complete)
+                        try:
+                            for line in response.text.splitlines():
+                                if line:
+                                    self.log(line)
+                        except Exception:
+                            pass
         run_client.wait_for_finish()
 
         dataset_id = self._get_run_dataset_id(run_id)
