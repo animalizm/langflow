@@ -10,7 +10,7 @@ export LANGFLOW_SAVE_DB_IN_CONFIG_DIR=true
 export LANGFLOW_COMPONENTS_PATH=/home/animalizm/langflow/components
 export LANGFLOW_LOAD_FLOWS_PATH=/home/animalizm/langflow/flows
 export LANGFLOW_LOG_FILE=/home/animalizm/langflow/langflow.log
-export LANGFLOW_LOG_LEVEL=debug
+export LANGFLOW_LOG_LEVEL=info
 export LANGFLOW_STORE_ENVIRONMENT_VARIABLES=true
 export LANGFLOW_API_KEY=sk-suw8vFLe7BNtgyY-ccLeMTIgA21lVXBVupY7KyPoyCU
 
